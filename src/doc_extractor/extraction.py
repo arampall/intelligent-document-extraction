@@ -1,82 +1,73 @@
 """
-OCR and LLM-based information extraction.
+Receipt extraction using Google Gemini Vision API.
 
-This module contains functions for extracting text using Tesseract
-and extracting structured information using Gemini LLM.
+This module provides functions for extracting structured information
+from receipt images using only the Gemini Vision API.
 """
 
-import pytesseract
 import json
 from google import genai
 
 
-# Prompt template for LLM extraction
-PROMPT_TEMPLATE = """
-Extract the information from the given list of images corresponding to a resume. The images are to be read in the order.
-Information to be extracted: category, total years of experience in the category, highest education.
-The images has been converted to grayscale, noise reduced, binarized, and deskewed using opencv.
-Always give your response in the following format:
+# Prompt template for receipt extraction
+RECEIPT_EXTRACTION_PROMPT = """
+Analyze this receipt image and extract all relevant information.
+
+Extract the following information in JSON format:
 {
-    "category": "category",
-    "Experience": "total years of experience in the category",
-    "education": "highest education",
+    "merchant_name": "Name of the business/store",
+    "date": "Date in YYYY-MM-DD format",
+    "time": "Time in HH:MM format (24-hour)",
+    "total": "Total amount as a number",
+    "subtotal": "Subtotal before tax (if available)",
+    "tax": "Tax amount (if available)",
+    "payment_method": "Payment method (Cash, Credit Card, Debit Card, etc.)",
+    "items": [
+        {
+            "name": "Item name",
+            "quantity": "Quantity as number",
+            "price": "Price per unit as number"
+        }
+    ],
+    "category": "Expense category (one of: Meals & Entertainment, Travel, Office Supplies, Transportation, Lodging, Other)",
+    "address": "Store address (if available)",
+    "phone": "Store phone number (if available)",
+    "receipt_number": "Receipt/transaction number (if available)"
 }
-Also, the text has been extracted from the images using tesseract.
-Use the extracted text as support for extracting information.
-If you believe the text extraction is incorrect somewhere, you may correct it yourself and provide corrected information.
-Respond with the extracted information only in the specified format.
-Here is the text extracted from all the images of the resume:
 
+Important notes:
+- Extract all amounts as numbers (e.g., 12.45, not "$12.45")
+- Use standard date format YYYY-MM-DD
+- Categorize based on the merchant and items purchased
+- If information is not available, use null
+- Be accurate with item names and prices
+- For category, choose the most appropriate from the list provided
 
+Respond with ONLY the JSON object, no additional text.
 """
 
 
-def extract_text_from_image(processed_image):
-    """Extract text from preprocessed image using Tesseract OCR.
+def extract_receipt_info(images, api_key, model='gemini-2.0-flash-exp'):
+    """Extract structured information from receipt using Gemini Vision API.
     
     Args:
-        processed_image: Preprocessed image (numpy array)
-        
-    Returns:
-        Extracted text as string
-    """
-    # TODO: Add error handling for OCR failures
-    # TODO: Add custom Tesseract configuration options
-    return pytesseract.image_to_string(processed_image)
-
-
-def extract_resume_info(images, extracted_text, api_key, model='gemini-2.0-flash-exp'):
-    """Extract structured information from resume using LLM.
-    
-    Args:
-        images: List of PIL Images (all pages of resume)
-        extracted_text: Combined OCR text from all images
+        images: List of PIL Images (receipt pages, usually just 1)
         api_key: Google API key for Gemini
         model: Model name to use (default: gemini-2.0-flash-exp)
         
     Returns:
         Tuple of (extracted_info dict, usage_metadata)
     """
-    # TODO: Fix prompt construction bug - currently prompt grows across iterations
-    # TODO: Add error handling for API failures
-    # TODO: Add retry logic with exponential backoff
-    # TODO: Add rate limiting
-    
     # Initialize Gemini client
     genai_client = genai.Client(api_key=api_key)
     
-    # Build the prompt
-    prompt = PROMPT_TEMPLATE + extracted_text
-    
-    # Prepare multimodal content (images + text)
+    # Prepare multimodal content (images + text prompt)
     contents = [
         images,
-        {
-            "text": prompt
-        }
+        {"text": RECEIPT_EXTRACTION_PROMPT}
     ]
     
-    print("\nExtracting information from image and text using LLM")
+    print("🔍 Extracting receipt information using Gemini Vision...")
     
     # Call Gemini API
     response = genai_client.models.generate_content(
@@ -84,13 +75,80 @@ def extract_resume_info(images, extracted_text, api_key, model='gemini-2.0-flash
         contents=contents
     )
     
-    # Access the usage_metadata attribute
+    # Access the usage metadata
     usage_metadata = response.usage_metadata
     
     # Parse JSON response
-    # TODO: Add better error handling for malformed JSON
-    extracted_information = json.loads(
-        response.text.replace('```json', '').replace('```', '')
-    )
+    try:
+        # Clean up any markdown code blocks
+        response_text = response.text.strip()
+        if response_text.startswith('```'):
+            # Remove code block markers
+            response_text = response_text.replace('```json', '').replace('```', '').strip()
+        
+        extracted_information = json.loads(response_text)
+        
+        # Add auto-calculated fields
+        if extracted_information.get('items') and not extracted_information.get('subtotal'):
+            # Calculate subtotal from items if not provided
+            subtotal = sum(
+                item.get('price', 0) * item.get('quantity', 1) 
+                for item in extracted_information['items']
+            )
+            if subtotal > 0:
+                extracted_information['subtotal'] = round(subtotal, 2)
+        
+        print("✅ Successfully extracted receipt information")
+        
+    except json.JSONDecodeError as e:
+        print(f"⚠️ Failed to parse JSON response: {e}")
+        print(f"Raw response: {response.text}")
+        # Return a basic structure with the error
+        extracted_information = {
+            "error": "Failed to parse receipt",
+            "raw_response": response.text
+        }
     
     return extracted_information, usage_metadata
+
+
+def categorize_expense(merchant_name, items):
+    """
+    Helper function to suggest expense category based on merchant and items.
+    This is a fallback if the LLM doesn't categorize properly.
+    
+    Args:
+        merchant_name: Name of the merchant
+        items: List of items purchased
+        
+    Returns:
+        Suggested category string
+    """
+    merchant_lower = merchant_name.lower() if merchant_name else ""
+    
+    # Food & Dining
+    food_keywords = ['restaurant', 'cafe', 'coffee', 'starbucks', 'burger', 'pizza', 'diner', 'bar']
+    if any(keyword in merchant_lower for keyword in food_keywords):
+        return "Meals & Entertainment"
+    
+    # Office Supplies
+    office_keywords = ['staples', 'office', 'depot', 'supplies', 'amazon']
+    if any(keyword in merchant_lower for keyword in office_keywords):
+        return "Office Supplies"
+    
+    # Transportation
+    transport_keywords = ['uber', 'lyft', 'taxi', 'parking', 'gas', 'fuel', 'shell', 'chevron']
+    if any(keyword in merchant_lower for keyword in transport_keywords):
+        return "Transportation"
+    
+    # Lodging
+    lodging_keywords = ['hotel', 'motel', 'airbnb', 'inn', 'resort']
+    if any(keyword in merchant_lower for keyword in lodging_keywords):
+        return "Lodging"
+    
+    # Travel
+    travel_keywords = ['airline', 'airport', 'flight', 'train', 'rental']
+    if any(keyword in merchant_lower for keyword in travel_keywords):
+        return "Travel"
+    
+    return "Other"
